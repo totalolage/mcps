@@ -1,13 +1,14 @@
 import { DateTime, Effect, Schema } from "effect";
-import { IsdsInvalidRequest } from "./errors.js";
-import { MessageEnvelope, type MessageStateFilter, messageStateMask, XsMessageState } from "./models.js";
+import { IsdsInvalidRequest, IsdsInvalidResponse } from "./errors.js";
+import { DataBoxId, MessageEnvelope, MessageId, type MessageStateFilter, messageStateMask, XsMessageState } from "./models.js";
 import { callIsds, type IsdsOperation } from "./soap.js";
 import { type XmlElement, xmlElement } from "./xml.js";
 import { formatXsDateTime, SafeInteger, XsBoolean, XsDateTime, XsInteger, xmlList } from "./xsd.js";
 
 /**
  * The dm_info list operations (dm_info.wsdl, service "info"): GetListOfReceivedMessages,
- * GetListOfSentMessages and GetMessageStateChanges. Field names follow dmBaseTypes.xsd.
+ * GetListOfSentMessages, GetMessageStateChanges and GetListForNotifications.
+ * Field names follow dmBaseTypes.xsd.
  */
 
 const xsiNamespace = "http://www.w3.org/2001/XMLSchema-instance";
@@ -105,7 +106,23 @@ const MessageListResponse = Schema.Struct({ dmRecords: Schema.optional(xmlList("
 /** tGetStateChangesOutput (dmBaseTypes.xsd:966-975). */
 const StateChangesResponse = Schema.Struct({ dmRecords: Schema.optional(xmlList("dmRecord", MessageStateChange)) });
 
+const NotificationRecord = Schema.Struct({
+  ntfType: XsInteger,
+  dmID: MessageId,
+  dmDeliveryTime: XsDateTime,
+  dbIDRecipient: DataBoxId,
+  dmAnnotation: Schema.String,
+  dbIDSender: DataBoxId,
+});
+export type NotificationRecord = typeof NotificationRecord.Type;
+
+const NotificationsResponse = Schema.Struct({
+  ntfRecords: Schema.optional(xmlList("ntfRecord", NotificationRecord)),
+  ntfListContinues: Schema.optional(XsBoolean),
+});
+
 const repeating: ReadonlySet<string> = new Set(["dmRecord"]);
+const repeatingNotifications: ReadonlySet<string> = new Set(["ntfRecord"]);
 
 const invalidRequest = (operation: string) => (error: { readonly message: string }) =>
   new IsdsInvalidRequest({ operation, detail: error.message });
@@ -220,6 +237,38 @@ export const listReceivedMessagesAndDeliver = Effect.fn("Isds.listReceivedMessag
  */
 export const listSentMessages = Effect.fn("Isds.listSentMessages")(function* (input: ListMessagesInput = {}) {
   return yield* listMessages("GetListOfSentMessages", input);
+});
+
+/**
+ * GetListForNotifications in SINGLE_BOX scope (§§2.13–2.14). Requires a system
+ * certificate and prior notification registration for the app and box.
+ * Reading the list has no legal delivery side effect.
+ */
+export const listReceivedNotifications = Effect.fn("Isds.listReceivedNotifications")(function* (from: DateTime.Utc) {
+  const operation = "GetListForNotifications";
+  let cursor = yield* Schema.decodeUnknownEffect(Schema.DateTimeUtc)(from).pipe(Effect.mapError(invalidRequest(operation)));
+  const arrivals = new Map<string, NotificationRecord>();
+  while (true) {
+    const time = yield* formatBound(operation, "from", cursor);
+    const { response } = yield* callIsds({
+      service: "info",
+      operation,
+      request: xmlElement(operation, [xmlElement("ntfFromTime", time), xmlElement("ntfScope", "SINGLE_BOX")]),
+      response: NotificationsResponse,
+      repeating: repeatingNotifications,
+      status: "dm",
+    });
+    const records = response.ntfRecords ?? [];
+    for (const record of records) {
+      if (record.ntfType === 1) arrivals.set(record.dmID, record);
+    }
+    if (response.ntfListContinues !== true) return [...arrivals.values()];
+    const next = records.at(-1)?.dmDeliveryTime;
+    if (next === undefined || !DateTime.isGreaterThan(next, cursor)) {
+      return yield* new IsdsInvalidResponse({ service: "info", operation, detail: "notification cursor did not advance" });
+    }
+    cursor = next;
+  }
 });
 
 /**
