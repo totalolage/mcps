@@ -8,7 +8,12 @@ import {
   getDeliveryInfo,
   ping,
 } from "./message-downloads.js";
-import { getMessageStateChanges, listReceivedMessagesAndDeliver, listSentMessages } from "./message-lists.js";
+import {
+  getMessageStateChanges,
+  listReceivedMessagesAndDeliver,
+  listReceivedNotifications,
+  listSentMessages,
+} from "./message-lists.js";
 import { reconcileSentMessage } from "./reconcile.js";
 import { IsdsTransport } from "./transport.js";
 
@@ -23,6 +28,7 @@ const operations = {
   findDataBoxes,
   checkDataBox,
   listReceivedMessagesAndDeliver,
+  listReceivedNotifications,
   listSentMessages,
   getMessageStateChanges,
   downloadMessageEnvelope,
@@ -58,6 +64,7 @@ const make = Effect.gen(function* () {
     findDataBoxes: provided(transport, findDataBoxes),
     checkDataBox: provided(transport, checkDataBox),
     listReceivedMessagesAndDeliver: provided(transport, listReceivedMessagesAndDeliver),
+    listReceivedNotifications: provided(transport, listReceivedNotifications),
     listSentMessages: provided(transport, listSentMessages),
     getMessageStateChanges: provided(transport, getMessageStateChanges),
     downloadMessageEnvelope: provided(transport, downloadMessageEnvelope),

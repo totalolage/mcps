@@ -10,6 +10,37 @@ A Bun workspace of [MCP](https://modelcontextprotocol.io) servers written with [
 
 The root holds what every workspace shares: `package.json` (workspaces, scripts, dev tools), one `bun.lock`, `bunfig.toml` (install policy), `tsconfig.base.json`, `vitest.config.ts`, `biome.json` with the Grit rules in `lint/`, and `scripts/ship-image.sh`.
 
+## MCP event subscriptions
+
+Both servers support `subscriptions/listen` on MCP `2026-07-28`. This revision opens a notification stream on the listen request. Earlier revisions defined `resources/subscribe` and could deliver updates on a separate GET stream over HTTP. Clients can still use the earlier revisions for tools. To receive events from these servers, the client must support the new listen request and its acknowledgment and update notifications. [MCP 2026-07-28 subscriptions](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/subscriptions) · [MCP 2025-11-25 resource subscriptions](https://modelcontextprotocol.io/specification/2025-11-25/server/resources#subscriptions)
+
+Use `resources/templates/list` to discover the URI template. Expand it with the account or box label and the filters you want. Each URI has its own filter. Use the same URI in `resources/read` after an update. See [Fio payment filters](servers/fio/README.md#payment-subscriptions) and [Datovka message filters](servers/datova-schranka/README.md#message-subscriptions).
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "subscriptions/listen",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    },
+    "notifications": {
+      "resourceSubscriptions": ["fio://payments/main?direction=in&currency=CZK"]
+    }
+  }
+}
+```
+
+Over HTTP, POST the request to `/mcp` with `Content-Type: application/json`, `Accept: application/json, text/event-stream`, `MCP-Protocol-Version: 2026-07-28`, and `Mcp-Method: subscriptions/listen`. Send the bearer token on OAuth deployments. For `resources/read`, send `Mcp-Method: resources/read` and `Mcp-Name` with the resource URI. Fio also supports subscriptions over stdio. Datovka serves them over authenticated HTTP.
+
+The server checks the grant and takes a baseline before it acknowledges the subscription. The baseline is silent. Each stream accepts up to eight URIs. About once a minute, the server polls and sends `notifications/resources/updated` for each URI with new matching IDs. The notification carries the URI and subscription ID. A single update can cover several rows. The server suppresses repeat updates for matching IDs it has already seen.
+
+Read the resource to get a JSON array of matching rows from the provider's recent window. During a provider outage, an active subscription keeps its last successful baseline and retries on the next poll. To unsubscribe, close the HTTP response stream or send `notifications/cancelled` with the listen request ID over stdio. An expired or revoked token, lost access, or a label pointing to a different source ends the subscription.
+
+After a disconnect, listen again and read the resource after acknowledgment to catch up. Keep the last processed IDs on the client if you need to avoid reprocessing rows. The server takes a fresh baseline on each listen and holds no replay log. Recovery from `resources/read` covers the provider's recent window.
+
 ## Development
 
 Requires Node.js 22.13 or newer and [Bun](https://bun.com) 1.4.2. Clone the repository and run everything from its root:

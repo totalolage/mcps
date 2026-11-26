@@ -1,4 +1,4 @@
-import { Effect, Predicate } from "effect";
+import { Context, Effect, Predicate } from "effect";
 import { type McpProtocol, McpSchema } from "effect/ai";
 import { coveredResources, holdsScopes, isListed, type ToolPolicyShape } from "../mcp/grants.js";
 import type { Resource } from "../resources.js";
@@ -70,16 +70,23 @@ export function grantedTools(
 /** The resources as of this request; they may change at runtime. */
 type CurrentResources = Effect.Effect<ReadonlyArray<Resource>>;
 
-const grantCore = (core: ToolsCore, resources: CurrentResources, policy: ToolPolicyShape): ToolsCore => ({
+const listingTools = Context.Reference("mcps/transport/ListingTools", { defaultValue: () => false });
+
+const grantCore = (
+  core: ToolsCore,
+  resources: CurrentResources,
+  policy: ToolPolicyShape,
+  shouldFilter: Effect.Effect<boolean>,
+): ToolsCore => ({
   ...core,
   tools: {
     ...core.tools,
-    list: (profile) =>
-      Effect.flatMap(core.tools.list(profile), (tools) =>
-        Effect.flatMap(CurrentPrincipal, (principal) =>
-          Effect.map(resources, (list) => grantedTools(tools, principal, list, policy)),
-        ),
-      ),
+    list: Effect.fnUntraced(function* (profile: unknown) {
+      const tools = yield* core.tools.list(profile);
+      if (!(yield* shouldFilter)) return tools;
+      const principal = yield* CurrentPrincipal;
+      return grantedTools(tools, principal, yield* resources, policy);
+    }),
   },
 });
 
@@ -87,22 +94,41 @@ const grantCore = (core: ToolsCore, resources: CurrentResources, policy: ToolPol
 // provides them where it installs the handlers.
 const handlersOf = (adapter: McpProtocol.ProtocolAdapter) => adapter as McpProtocol.AnyProtocolAdapter<string, never>;
 
+interface HandlerTarget {
+  readonly install: (protocol: unknown, rpcs: unknown, handlers: Record<string, unknown>) => Effect.Effect<void>;
+}
+
+type ListToolsHandler = (
+  ...args: ReadonlyArray<unknown>
+) => Effect.Effect<unknown, { readonly code: number; readonly message: string }, McpSchema.McpRequestContext>;
+
 const grantAdapter = (
   adapter: McpProtocol.ProtocolAdapter,
   resources: CurrentResources,
   policy: ToolPolicyShape,
 ): McpProtocol.ProtocolAdapter => ({
   ...adapter,
-  installHandlers: (core, lifecycle, target) => {
-    // Only the stateful revisions are offered and tested. Stateless ones read
-    // `tools.list` inside `tools/call` too (header validation).
-    if (adapter.runtime._tag !== "Stateful") {
-      return Effect.die(`grant-tools: MCP ${adapter.protocolVersion} is stateless; grant filtering is tested on stateful revisions only`);
-    }
+  installHandlers: (core, lifecycle, target: HandlerTarget) => {
     if (!isToolsCore(core)) {
       return Effect.die(`grant-tools: the MCP core for ${adapter.protocolVersion} no longer has tools.list; update src/transport/grant-tools.ts`);
     }
-    return handlersOf(adapter).installHandlers(grantCore(core, resources, policy), lifecycle, target);
+    if (adapter.runtime._tag === "Stateful") {
+      return handlersOf(adapter).installHandlers(grantCore(core, resources, policy, Effect.succeed(true)), lifecycle, target);
+    }
+    // The stateless adapter also uses tools.list to validate tools/call
+    // routing headers. Only tools/list discovery sees the grant projection.
+    return handlersOf(adapter).installHandlers(grantCore(core, resources, policy, listingTools), lifecycle, {
+      ...target,
+      install: (protocol: unknown, rpcs: unknown, handlers: Record<string, unknown>) => {
+        const list = handlers["tools/list"];
+        if (typeof list !== "function") return Effect.die("Effect did not install MCP tools/list");
+        return target.install(protocol, rpcs, {
+          ...handlers,
+          "tools/list": (...args: ReadonlyArray<unknown>) =>
+            Effect.provideService((list as ListToolsHandler)(...args), listingTools, true),
+        });
+      },
+    });
   },
 });
 

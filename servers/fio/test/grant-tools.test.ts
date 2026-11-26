@@ -298,9 +298,9 @@ describe("grantProtocols", () => {
     }),
   );
 
-  it.effect("refuses stateless revisions, which are not offered or tested", () =>
+  it.effect("checks the core shape before installing stateless handlers too", () =>
     Effect.gen(function* () {
-      const exit = yield* install(McpProtocol.v2026_07_28, { tools: { list: () => Effect.succeed([]) } });
+      const exit = yield* install(McpProtocol.v2026_07_28, { tools: {} });
       assert.isTrue(Exit.isFailure(exit) && Cause.hasDies(exit.cause));
     }),
   );
