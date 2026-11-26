@@ -246,7 +246,7 @@ export const listSentMessages = Effect.fn("Isds.listSentMessages")(function* (in
  */
 export const listReceivedNotifications = Effect.fn("Isds.listReceivedNotifications")(function* (from: DateTime.Utc) {
   const operation = "GetListForNotifications";
-  let cursor = yield* Schema.decodeUnknownEffect(Schema.DateTimeUtc)(from).pipe(Effect.mapError(invalidRequest(operation)));
+  let cursor = yield* Schema.decodeEffect(Schema.DateTimeUtc)(from).pipe(Effect.mapError(invalidRequest(operation)));
   const arrivals = new Map<string, NotificationRecord>();
   while (true) {
     const time = yield* formatBound(operation, "from", cursor);

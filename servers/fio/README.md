@@ -239,6 +239,22 @@ Orders are sent in the order FIO requires (domestic, euro, foreign), and all tex
 
 The key belongs to the grant (or, without OAuth, to the server) and is recorded with the SHA-256 of the exact XML. A second call with the same key and the same orders returns the recorded result without uploading again; the same key with different orders is refused with `InvalidInput`. The first call that passes validation owns the key, even when the server then refuses the batch, so a corrected batch needs a new key. Keys are kept as long as the audit rows (at least 365 days).
 
+## Payment subscriptions
+
+Subscribe to booked account movements with [MCP event subscriptions](../../README.md#mcp-event-subscriptions). The URI template is `fio://payments/{account}{?direction,currency,minAmount,maxAmount,variableSymbol,counterpartyAccount}`. Use the percent-encoded account name. Over OAuth, the client needs `fio:read` and a grant for that account.
+
+| Filter | Match |
+|---|---|
+| `direction` | `in` for positive amounts or `out` for negative amounts. Omit it to watch both. |
+| `currency` | An exact uppercase three-letter currency code. |
+| `minAmount`, `maxAmount` | Inclusive bounds on the absolute amount. Use a nonnegative decimal with a period if it has a fractional part. |
+| `variableSymbol` | An exact variable symbol, including leading zeros. |
+| `counterpartyAccount` | An exact Czech account number, optionally with `/bankCode`, or an IBAN. Percent-encode the slash in the query value. |
+
+All filters are optional and combine with AND. For example, `fio://payments/main?direction=out&currency=CZK&minAmount=500` watches outgoing CZK movements of at least 500 on `main`.
+
+The server polls Fio's read-only `/periods` endpoint for today and the previous six Prague calendar days. It uses the shared per-token rate limiter at background priority and reuses each successful snapshot for 30 seconds. Polling leaves Fio's download marker untouched and works with the local cache disabled. The filtered resource returns movement IDs, dates, signed amounts, directions, currencies, variable symbols, and counterparty account identifiers.
+
 ## Payment safety
 
 - **fio-mcp never executes a payment.** An imported batch only waits in Internetbanking until an authorized person signs it there (SMS or Fio signature); FIO processes nothing before that. This signature is the one control that holds whatever the model believes, and every check below sits in front of it, not in its place. Never turn on a FIO setting that would let API batches run without a signature, if FIO ever offers one. Treat an upload as real anyway: it creates a pending batch in the bank. The `submit_payment_orders` description and its `nextStep` text say the same to the model.

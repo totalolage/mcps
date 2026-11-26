@@ -13,7 +13,24 @@ The official v3.11 WSDL/XSD the ISDS client follows are in `wsdl/`.
 
 **Listing received messages delivers them.** The list call logs in to the box, and ISDS treats every eligible received message as delivered by login (event EV13). Delivery starts the legal deadlines that run from it. Filters and limits on the call do not narrow this: one list delivers every eligible message in the box, including ones the response leaves out. Downloads and envelope reads do not deliver, but ISDS refuses them for a message that was not delivered yet.
 
-So a grant that includes `isds:read` needs a ticked checkbox on the consent page that states this. Without it the authorization fails. The audit log records the grant, the boxes, the time and the version of the consent wording. If you want to keep messages undelivered until you open them yourself, do not use this server with that box.
+So a grant that includes `isds:read` needs a ticked checkbox on the consent page that states this. Without it the authorization fails. The audit log records the grant, the boxes, the time and the version of the consent wording. To keep messages undelivered until you open them yourself, use the received-message subscription on a registered certificate box.
+
+## Message subscriptions
+
+Subscribe to newly received or sent messages with [MCP event subscriptions](../../README.md#mcp-event-subscriptions). The URI template is `datovka://messages/{box}{?direction,sender,recipient,subject}`. Use the percent-encoded box label. The client needs `isds:read`, accepted read consent, and a grant for that box.
+
+| Filter | Match |
+|---|---|
+| `direction` | `received` (the default) or `sent`. Use two URIs to watch both. |
+| `sender` | An exact sender box ID. |
+| `recipient` | An exact recipient box ID. |
+| `subject` | A case-insensitive substring of the message subject. |
+
+Filters combine with AND. For example, `datovka://messages/Main?direction=received&sender=abc2def&subject=invoice` watches incoming messages with that sender and subject text. The resource contains message IDs, directions, sender and recipient box IDs when available, and the time ISDS put the message in the recipient's box when available.
+
+Received subscriptions use `GetListForNotifications` with `SINGLE_BOX`. This feed leaves legal delivery and unread status untouched. Configure the box with a system certificate. Before subscribing, call `RegisterForNotifications` with `action=1` for that box using the same ISDS application identity. The server reports a missing registration when it tries to take the baseline. Password-based boxes support sent subscriptions. [ISDS web services manual, sections 2.13–2.14](https://testrs.gov.cz/smlouva/soubor/382322/WS_manipulace_s_datovymi_zpravami.pdf#page=81)
+
+Both directions use a rolling 24-hour window. Filters on the same grant, box, and direction can reuse a successful snapshot for 45 seconds. Received subscriptions watch arrivals. Sent subscriptions watch entries in the sent list, which can include messages before delivery.
 
 ## Sending
 

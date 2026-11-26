@@ -5,6 +5,7 @@ import { ByteSize, Clock, Effect, Exit, Fiber, Layer, Predicate, Result, Schema,
 import { McpServer } from "effect/ai";
 import { Headers, HttpEffect, HttpMiddleware, HttpRouter, type HttpServerError, HttpServerRequest, HttpServerResponse } from "effect/http";
 import type { IpNetwork } from "effect/net";
+import { type EventResource, eventProtocols, eventResourceLayer, RecheckEventPrincipal } from "../mcp/event-subscriptions.js";
 import { ToolPolicy } from "../mcp/grants.js";
 import { Resources } from "../resources.js";
 import { Auth } from "./auth.js";
@@ -380,7 +381,15 @@ const mcpAuth = (maxBodyBytes: number) =>
       ) {
         const subject = principal.subject;
         const session = request.headers[MCP_SESSION_HEADER];
-        const handle = Effect.provideService(httpEffect, CurrentPrincipal, principal);
+        const handle = httpEffect.pipe(
+          Effect.provideService(CurrentPrincipal, principal),
+          Effect.provideService(
+            RecheckEventPrincipal,
+            Effect.suspend(() => auth.authenticate(request)).pipe(
+              Effect.mapError(() => "The subscription authorization ended."),
+            ),
+          ),
+        );
         let initializes = false;
         if (request.method === "POST") {
           const body = yield* readBody(request, maxBodyBytes);
@@ -455,9 +464,11 @@ export const httpRouterApp = <A, E, R, EA, RA>(
   auth: Layer.Layer<Auth, EA, RA>,
   info: ServerInfo,
   config: HttpTransportConfig,
+  events?: EventResource,
 ) =>
   Layer.mergeAll(
     app,
+    events === undefined ? Layer.empty : eventResourceLayer(events),
     HealthRoute,
     guard(config.allowedHosts, config.trustedProxies, config.trustedProxiesSetting, {
       protectEmbeddedResources: config.protectEmbeddedResources,
@@ -470,7 +481,7 @@ export const httpRouterApp = <A, E, R, EA, RA>(
           const policy = yield* ToolPolicy;
           return McpServer.layerHttp({
             ...info,
-            protocols: grantProtocols(info.protocols, resources.list, policy),
+            protocols: grantProtocols(events === undefined ? info.protocols : eventProtocols(info, events), resources.list, policy),
             path: MCP_PATH,
             allowedOrigins: config.allowedOrigins,
             allowSessionTermination: true,
@@ -490,7 +501,8 @@ export const serveHttp = <A, E, R, EA, RA>(
   auth: Layer.Layer<Auth, EA, RA>,
   info: ServerInfo,
   config: HttpTransportConfig,
+  events?: EventResource,
 ) =>
-  HttpRouter.serve(httpRouterApp(app, auth, info, config)).pipe(
+  HttpRouter.serve(httpRouterApp(app, auth, info, config, events)).pipe(
     Layer.provideMerge(NodeHttpServer.layer(createServer, { host: config.host, port: config.port })),
   );

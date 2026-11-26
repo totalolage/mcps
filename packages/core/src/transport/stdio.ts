@@ -1,8 +1,10 @@
 // McpServer.layerStdio is built on the Stdio service, which effect marks unstable.
 import { Effect, Layer, Sink, Stdio } from "effect";
 import { McpServer } from "effect/ai";
+import { type EventResource, eventProtocols, eventResourceLayer } from "../mcp/event-subscriptions.js";
 import { Redactor } from "../redaction.js";
 import { makeFrameRedactor } from "./frame-redaction.js";
+import { LOCAL_PRINCIPAL } from "./principal.js";
 import type { ServerInfo } from "./server-info.js";
 
 /**
@@ -28,5 +30,12 @@ export const RedactingStdio: Layer.Layer<Stdio.Stdio, never, Stdio.Stdio | Redac
 );
 
 /** MCP over stdin/stdout with a redacting stdout. Needs a platform `Stdio`. */
-export const layerStdio = (info: ServerInfo) =>
-  McpServer.layerStdio(info).pipe(Layer.provide(RedactingStdio));
+export const layerStdio = (info: ServerInfo, events?: EventResource) => {
+  const transport = McpServer.layerStdio({
+    ...info,
+    protocols: events === undefined ? info.protocols : eventProtocols(info, events, LOCAL_PRINCIPAL),
+  }).pipe(Layer.provide(RedactingStdio));
+  return events === undefined
+    ? transport
+    : eventResourceLayer(events, LOCAL_PRINCIPAL).pipe(Layer.provideMerge(transport));
+};

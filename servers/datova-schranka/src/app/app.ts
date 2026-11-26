@@ -16,6 +16,7 @@ import { storeFailure } from "../domain/errors.js";
 import { ReadService } from "../domain/read-service.js";
 import { RecipientTiers } from "../domain/recipient-tiers.js";
 import { ZfoStore } from "../domain/zfo-store.js";
+import { makeMessageEvents } from "../mcp/message-events.js";
 import { toolPolicyLayer } from "../mcp/policy.js";
 import { SERVER_NAME, SERVER_VERSION } from "../mcp/server-info.js";
 import type { ToolGroup } from "../mcp/tool-group.js";
@@ -137,6 +138,7 @@ export const httpApp = (features: Features) =>
     Layer.unwrap(
       Effect.gen(function* () {
         const { http } = yield* AppConfig;
+        const events = yield* makeMessageEvents;
         return serveHttp(toolsLive(features.toolGroups), authLive(features.adminTabs), SERVER_INFO, {
           host: http.host,
           port: http.port,
@@ -147,7 +149,7 @@ export const httpApp = (features: Features) =>
           maxBodyBytes: MAX_MCP_BODY_BYTES,
           // download_message's attachment blobs are exact bytes: withhold a result redaction would alter (R4).
           protectEmbeddedResources: true,
-        });
+        }, events);
       }),
     ),
     features.background,

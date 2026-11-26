@@ -16,6 +16,7 @@ import { AppConfig, type HttpTransportConfig } from "./config.js";
 import { FioApi } from "./fio-api.js";
 import { CACHE_INSTRUCTIONS, CacheToolsLive } from "./mcp/cache-tools.js";
 import { FioToolsLive, SERVER_INSTRUCTIONS } from "./mcp/fio-tools.js";
+import { makePaymentEvents } from "./mcp/payment-events.js";
 import { ConfiguredToolPolicy } from "./mcp/tool-policy.js";
 import { listClientsCommand, resetAdminPasswordCommand, revokeAllTokensCommand, revokeClientCommand } from "./oauth/cli.js";
 import { PaymentControls } from "./payment-controls.js";
@@ -80,16 +81,24 @@ const withServices = <A, E, R>(transport: Layer.Layer<A, E, R>) =>
 
 // stdio has one trusted local client: full access, captured when the tools register.
 export const StdioAppLive = withServices(
-  ToolsLive.pipe(
-    Layer.provide(LocalPrincipalLive),
-    Layer.provide(layerStdio(SERVER_INFO)),
-    Layer.provide(NodeStdio.layer),
+  Layer.unwrap(
+    Effect.map(makePaymentEvents(), (events) =>
+      ToolsLive.pipe(
+        Layer.provide(LocalPrincipalLive),
+        Layer.provide(layerStdio(SERVER_INFO, events)),
+        Layer.provide(NodeStdio.layer),
+      ),
+    ),
   ),
 );
 
 export const HttpAppLive = (config: HttpTransportConfig) =>
   withServices(
-    serveHttp(ToolsLive, authFromConfig, SERVER_INFO, { ...config, trustedProxiesSetting: TRUSTED_PROXIES_SETTING }),
+    Layer.unwrap(
+      Effect.map(makePaymentEvents(), (events) =>
+        serveHttp(ToolsLive, authFromConfig, SERVER_INFO, { ...config, trustedProxiesSetting: TRUSTED_PROXIES_SETTING }, events),
+      ),
+    ),
   );
 
 /** The transport selected by FIO_MCP_TRANSPORT. */

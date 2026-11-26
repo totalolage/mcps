@@ -10,15 +10,16 @@ import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { REDACTED } from "@mcps/core/redaction.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { CallToolResult, JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { Effect, Redacted } from "effect";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { BOX_AUDIT_ACTIONS } from "../../src/admin/boxes-tab.js";
 import { IsdsAuthError } from "../../src/isds/errors.js";
 import { READ_SCOPE, SEND_SCOPE } from "../../src/mcp/tool-group.js";
 import { CONSENT_ACTION } from "../../src/oauth/app.js";
 import { fakeIsdsTransports, loginResponder } from "../domain/support/fake-isds.js";
-import { fixture, ok } from "../isds/fake-transport.js";
+import { dmStatus, fixture, ok, soapResponse } from "../isds/fake-transport.js";
 import { createTestPki, type TestPki } from "../isds/support/pki.js";
 import { type E2eApp, SCRUBBED, startE2eApp } from "./support/app.js";
 
@@ -90,9 +91,9 @@ afterEach(async () => {
 });
 
 /** The app over a fake ISDS that logs MAIN in by username and SIGNED by its certificate passphrase. */
-const start = async () => {
+const start = async (notificationReply?: () => string) => {
   const logins = loginResponder({ [MAIN.username]: MAIN.dbId, [pki.clientPassphrase]: SIGNED.dbId }, (config, request) => {
-    const reply = READ_REPLIES[request.operation];
+    const reply = request.operation === "GetListForNotifications" ? notificationReply?.() : READ_REPLIES[request.operation];
     if (reply === undefined) return Effect.die(`unexpected ISDS operation ${request.operation}`);
     const password = config.credentials._tag === "Password" ? Redacted.value(config.credentials.password) : "";
     return request.operation === "GetListOfSentMessages"
@@ -131,6 +132,58 @@ const countBy = (values: ReadonlyArray<string>) =>
   Object.fromEntries(Array.from(new Set(values), (value) => [value, values.filter((v) => v === value).length]));
 
 describe("datova-schranka end to end (fake ISDS)", () => {
+  it("streams new matching arrivals over OAuth without listing or delivering received messages", async () => {
+    const record = (id: string, subject: string) =>
+      `<ntfRecord><ntfType>1</ntfType><dmID>${id}</dmID><dmDeliveryTime>2026-07-01T12:00:00Z</dmDeliveryTime><dbIDRecipient>${SIGNED.dbId}</dbIDRecipient><dmAnnotation>${subject}</dmAnnotation><dbIDSender>abc2def</dbIDSender></ntfRecord>`;
+    const rows = [record("123", "Invoice baseline")];
+    const running = await start(() =>
+      soapResponse("GetListForNotifications", `<ntfRecords>${rows.join("")}</ntfRecords><ntfListContinues>false</ntfListContinues>${dmStatus("0000")}`),
+    );
+    await addBoxes(running);
+    const grant = await running.consent({ boxes: [SIGNED.label], scopes: [READ_SCOPE], deliveryConsent: true });
+    const uri = `datovka://messages/${SIGNED.label}?sender=abc2def&subject=invoice`;
+    const version = "2026-07-28";
+    const _meta = { "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientCapabilities": {} };
+    const connection = new StreamableHTTPClientTransport(new URL("/mcp", running.base), {
+      requestInit: { headers: { authorization: `Bearer ${grant.access}` } },
+      fetch: (url, init) => {
+        const headers = new Headers(init?.headers);
+        const request = JSON.parse(String(init?.body));
+        headers.set("mcp-method", request.method);
+        if (request.method === "resources/read") headers.set("mcp-name", request.params.uri);
+        // The SDK's side of the loopback socket, outside Effect.
+        // @effect-diagnostics-next-line globalFetch:off
+        return fetch(url, { ...init, headers });
+      },
+    });
+    connection.setProtocolVersion(version);
+    const messages: JSONRPCMessage[] = [];
+    connection.onmessage = (message) => messages.push(message);
+    await connection.start();
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    try {
+      await connection.send({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "subscriptions/listen",
+        params: { _meta, notifications: { resourceSubscriptions: [uri] } },
+      });
+      await vi.waitFor(() => expect(messages[0]).toMatchObject({ method: "notifications/subscriptions/acknowledged" }));
+      expect(messages).toHaveLength(1);
+      rows.push(record("124", "Unrelated"), record("125", "New INVOICE"));
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(() => expect(messages[1]).toMatchObject({ method: "notifications/resources/updated", params: { uri } }));
+      await connection.send({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { _meta, uri } });
+      expect(messages[2]).toMatchObject({ id: 2, result: { contents: [{ uri, text: expect.stringContaining('"id":"125"') }] } });
+      expect(JSON.stringify(messages[2])).not.toContain("Unrelated");
+      expect(JSON.stringify(messages[2])).not.toContain("124");
+      expect(isds.requests.map(({ request }) => request.operation)).not.toContain("GetListOfReceivedMessages");
+    } finally {
+      vi.useRealTimers();
+      await connection.close();
+    }
+  });
+
   it("adds boxes in /admin, consents in the browser, calls six read tools over MCP and audits each step once", async () => {
     const running = await start();
     const admin = await addBoxes(running);
