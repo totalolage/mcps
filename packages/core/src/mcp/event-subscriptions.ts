@@ -38,6 +38,7 @@ export const RecheckEventPrincipal = Context.Reference<Effect.Effect<Principal, 
 const activeSubscription = Context.Reference<{
   readonly acknowledged: Deferred.Deferred<void>;
   readonly authorized: Effect.Effect<Principal, string>;
+  readonly authorizationFailed: Deferred.Deferred<never, string>;
 } | undefined>("mcps/mcp/ActiveEventSubscription", { defaultValue: () => undefined });
 
 const mimeType = "application/json";
@@ -56,9 +57,9 @@ export const eventResourceLayer = (events: EventResource, local?: Principal) =>
           mimeType,
         }),
         annotations: Context.make(McpSchema.EnabledWhen, (client) => client.protocolVersion === version),
-        // Effect's resource matcher routes the path. The provider validates
-        // the original URI, including the query and percent-encoded label.
-        routerPath: path.replace(":", "::").replace(/\{[^{}]+\}/, ":0"),
+        // Match the prefix so the router's named-parameter length limit
+        // doesn't reject valid labels. The provider validates the full URI.
+        routerPath: path.replace(":", "::").replace(/\{[^{}]+\}/, "*"),
         completions: {},
         handle: Effect.fnUntraced(function* (uri: string) {
           const principal = local ?? (yield* CurrentPrincipal);
@@ -127,25 +128,16 @@ const listenForEvents = (nativeListen: Listen, send: Send, events: EventResource
         ? (yield* RecheckEventPrincipal) ?? Effect.fail("The subscription authorization is unavailable.")
         : Effect.succeed(local);
     const authorized = recheck.pipe(
+      Effect.timeoutOrElse({
+        duration: "10 seconds",
+        orElse: () => Effect.fail("The subscription authorization is unavailable."),
+      }),
       Effect.filterOrFail((current) => current.subject === principal.subject, () => "The subscription authorization changed."),
     );
-    const initial = yield* Effect.forEach(uris, (uri) =>
-      Effect.map(events.open(uri, principal), (snapshot) => ({ uri, snapshot })),
+    const watched = yield* Effect.forEach(uris, (uri) =>
+      Effect.map(events.open(uri, principal), (snapshot): WatchedResource => ({ uri, source: snapshot.source, seen: new Map() })),
     ).pipe(
       Effect.mapError((message) => ({ code: -32602, message })),
-    );
-    const now = yield* Clock.currentTimeMillis;
-    const watched = yield* Effect.forEach(
-      initial,
-      ({ uri, snapshot }): Effect.Effect<WatchedResource, string> =>
-        Effect.map(snapshot.read, (rows) => ({
-          uri,
-          source: snapshot.source,
-          seen: new Map(rows.map(({ id }) => [id, now])),
-        })),
-      { concurrency: maxUris },
-    ).pipe(
-      Effect.mapError((message) => ({ code: -32603, message })),
     );
     const resolve = Effect.fnUntraced(function* (current: Principal, resource: WatchedResource) {
       const snapshot = yield* events.open(resource.uri, current);
@@ -155,9 +147,22 @@ const listenForEvents = (nativeListen: Listen, send: Send, events: EventResource
     const resolveAll = Effect.flatMap(authorized, (current) =>
       Effect.forEach(watched, (resource) => Effect.map(resolve(current, resource), (snapshot) => ({ resource, snapshot }))),
     );
-    yield* resolveAll.pipe(Effect.mapError((message) => ({ code: -32602, message })));
-
     const acknowledged = yield* Deferred.make<void>();
+    const authorizationFailed = yield* Deferred.make<never, string>();
+    const end = Effect.fnUntraced(function* (message: string) {
+      if (!(yield* Deferred.isDone(acknowledged))) return yield* Effect.fail({ code: -32602, message });
+      return {
+        resultType: "complete",
+        _meta: { [subscriptionId]: context.requestId, "io.modelcontextprotocol/serverInfo": { name: info.name, version: info.version } },
+      };
+    });
+    // This runs separately from upstream reads and transport writes so an
+    // authorization failure can interrupt either while it is pending.
+    const watchAuthorization = Effect.raceFirst(
+      Effect.forever(Effect.sleep(pollInterval).pipe(Effect.andThen(resolveAll))),
+      Deferred.await(authorizationFailed),
+    ).pipe(Effect.catch(end));
+
     const poll = Effect.gen(function* () {
       while (true) {
         yield* Effect.sleep(pollInterval);
@@ -177,22 +182,28 @@ const listenForEvents = (nativeListen: Listen, send: Send, events: EventResource
           });
         }
       }
-    }).pipe(
-      Effect.orElseSucceed(() => ({
-        resultType: "complete",
-        _meta: { [subscriptionId]: context.requestId, "io.modelcontextprotocol/serverInfo": { name: info.name, version: info.version } },
-      })),
-    );
+    }).pipe(Effect.catch(end));
     const notifications =
       request.notifications.resourceSubscriptions === undefined
         ? request.notifications
         : { ...request.notifications, resourceSubscriptions: uris };
-    return yield* Effect.raceFirst(
-      nativeListen({ ...request, notifications }, context).pipe(
-        Effect.provideService(activeSubscription, { acknowledged, authorized }),
-      ),
-      Deferred.await(acknowledged).pipe(Effect.andThen(poll)),
-    );
+    const listen = Effect.gen(function* () {
+      const initial = yield* resolveAll.pipe(Effect.mapError((message) => ({ code: -32602, message })));
+      const now = yield* Clock.currentTimeMillis;
+      yield* Effect.forEach(
+        initial,
+        ({ resource, snapshot }) => Effect.map(snapshot.read, (rows) => hasNewRows(resource.seen, rows, now)),
+        { concurrency: maxUris, discard: true },
+      ).pipe(Effect.mapError((message) => ({ code: -32603, message })));
+      yield* resolveAll.pipe(Effect.mapError((message) => ({ code: -32602, message })));
+      return yield* Effect.raceFirst(
+        nativeListen({ ...request, notifications }, context).pipe(
+          Effect.provideService(activeSubscription, { acknowledged, authorized, authorizationFailed }),
+        ),
+        Deferred.await(acknowledged).pipe(Effect.andThen(poll)),
+      );
+    });
+    return yield* Effect.raceFirst(listen, watchAuthorization);
   });
 
 /**
@@ -223,11 +234,14 @@ export function eventProtocols(info: ServerInfo, events: EventResource, local?: 
               const active = yield* activeSubscription;
               const sendMessage = send(revision, clientId, notification);
               if (active === undefined) return yield* sendMessage;
+              const current = yield* Effect.result(active.authorized);
+              if (Result.isFailure(current)) {
+                yield* Deferred.fail(active.authorizationFailed, current.failure);
+                return;
+              }
+              yield* sendMessage;
               if (notification.tag === "notifications/subscriptions/acknowledged") {
-                yield* sendMessage;
                 yield* Deferred.succeed(active.acknowledged, undefined);
-              } else if (Result.isSuccess(yield* Effect.result(active.authorized))) {
-                yield* sendMessage;
               }
             }),
           },

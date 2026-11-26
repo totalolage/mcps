@@ -19,6 +19,7 @@ const url = new URL("http://mcp.example.test/mcp");
 const template = "demo://events/{box}{?direction}";
 const incoming = "demo://events/inbox?direction=in";
 const outgoing = "demo://events/inbox?direction=out";
+const longLabel = `demo://events/${encodeURIComponent("📬".repeat(64))}?direction=in`;
 
 const statusToolkit = Toolkit.make(Tool.make("status", { parameters: Schema.Struct({ label: Schema.String }), success: Schema.String }));
 const tools = McpServer.toolkit(statusToolkit).pipe(
@@ -31,17 +32,22 @@ function start() {
   let revoked = false;
   let source = "inbox-id";
   let unavailable = false;
+  let blocked = false;
+  let interrupted = false;
   const events: EventResource = {
     uriTemplate: template,
     name: "Demo events",
     description: "Recent events",
     open: (uri, principal) => {
-      if (uri !== incoming && uri !== outgoing) return Effect.fail("Unknown event resource.");
+      if (uri !== incoming && uri !== outgoing && uri !== longLabel) return Effect.fail("Unknown event resource.");
       if (principal.resources !== "all" && !principal.resources.includes(source)) return Effect.fail("No access to the event resource.");
       return Effect.succeed({
         source,
         read: Effect.suspend(() => {
           reads++;
+          if (blocked) {
+            return Effect.never.pipe(Effect.ensuring(Effect.sync(() => { interrupted = true; })));
+          }
           return unavailable ? Effect.fail("Unavailable.") : Effect.succeed(rows.filter((row) => uri.endsWith(row.direction)));
         }),
       });
@@ -104,6 +110,10 @@ function start() {
     unavailable: (value: boolean) => {
       unavailable = value;
     },
+    block: () => {
+      blocked = true;
+    },
+    interrupted: () => interrupted,
     transport,
     async connect(subject: string) {
       const connection = transport(subject);
@@ -224,6 +234,43 @@ it("keeps a successful baseline across source errors and stops if the label reso
     expect(server.reads()).toBe(reads);
   } finally {
     vi.useRealTimers();
+    await server.close();
+  }
+});
+
+it("interrupts an outstanding provider poll when a grant is revoked", async () => {
+  const server = start();
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const owner = await server.connect("owner");
+    await owner.request(8, "subscriptions/listen", { notifications: { resourceSubscriptions: [incoming] } });
+    await vi.waitFor(() => expect(owner.messages[0]).toMatchObject({ method: "notifications/subscriptions/acknowledged" }));
+    server.block();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(server.reads()).toBe(2);
+    expect(server.interrupted()).toBe(false);
+    server.revoke();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(owner.messages[1]).toMatchObject({ id: 8, result: { resultType: "complete" } });
+    expect(server.interrupted()).toBe(true);
+  } finally {
+    vi.useRealTimers();
+    await server.close();
+  }
+});
+
+it("lets the client read an acknowledged URI with the longest Unicode label", async () => {
+  const server = start();
+  try {
+    const owner = await server.connect("owner");
+    await owner.request(9, "subscriptions/listen", { notifications: { resourceSubscriptions: [longLabel] } });
+    await vi.waitFor(() => expect(owner.messages[0]).toMatchObject({
+      method: "notifications/subscriptions/acknowledged",
+      params: { notifications: { resourceSubscriptions: [longLabel] } },
+    }));
+    await owner.request(10, "resources/read", { uri: longLabel });
+    expect(owner.messages[1]).toMatchObject({ id: 10, result: { contents: [{ uri: longLabel, text: expect.stringContaining("baseline") }] } });
+  } finally {
     await server.close();
   }
 });
